@@ -1,0 +1,2495 @@
+#include <string.h>
+
+#include "mcc_generated_files/uart2.h"
+#include "mcc_generated_files/tmr1.h"
+#include "mcc_generated_files/tmr2.h"
+#include "mcc_generated_files/tmr3.h"       // For LED-handling during battery charging
+#include "mcc_generated_files/adc1.h"
+#include "mcc_generated_files/i2c1.h"
+#include "mcc_generated_files/pin_manager.h"
+
+// To get a PWM-signal
+//#include "mcc_generated_files/oc1.h"
+//#include "mcc_generated_files/tmr3.h"
+
+#include "common.h"
+#include "electrodes.h"
+#include "eeprom.h"
+#include "dac.h"
+#include "imu.h"
+#include "NEMS.h"
+
+#define SIZE_OF_PROGRAM                 14
+#define MAX_NO_OF_RAMP_PULSES           100
+#define NO_OF_ELECTRODES                32
+#define TIMER_FREQUENCY                 20000
+#define SILENCE_PERIOD                  1    // 1 cycle if TIMER_FREQUENCY
+#define NO_OF_STRAIN_GAUGE_VALS         8
+#define SIZE_OF_STRAIN_GAUGE_VAL_BUF    (4 * NO_OF_STRAIN_GAUGE_VALS)
+//#define CONTACT_SCAN_NO_OF_PHASE_TICKS  10
+#define CONTACT_SCAN_AMPLITUDE_MILLI_A  120     /* This actually means 1 mA */
+//#define MEASURE_STRAIN_GAUGE
+//#define PWM_OUTPUT
+#define CONTACT_SCAN_NO_OF_TICKS        100
+#define CONTACT_SCAN_NO_OF_CONV         3
+#define LED_ON_TICKS                    2000        /* 100 ms (2000 * 50 us = 100 ms) */
+#define LED_CLEAR_CNTR_TICKS            20000       /* 1 sec */
+
+typedef union
+{
+    uint8_t b[SIZE_OF_PROGRAM];
+    
+    struct
+    {
+        uint8_t amplitude;          // [mA] 1 mA - 31 mA or higher (pp. 31, Chap 3)
+        uint8_t amplitude2;
+        uint8_t frequency;          // [Hz] 15 - 50 (pp. 32, Chap 3))
+        uint8_t phaseNoOfTicks;     // [us/50] ( 200us - 400us --> 4 - 8) (pp. 83, Chap 6)
+        uint8_t symmetryFactor;     // symmetric = 1, asymmetric = phase_negative/ phase_duration = [2,4,8]
+        uint8_t onTime;             // [s] 2s-4s (pp. 86, Chap 6) ON/OFF ~ 4:12, 1:3 
+        uint8_t offTime;            // [s] ON/OFF 1/3 to 1/5  over 10-15 contractions
+        uint8_t contractions;       // number of contractions depends on the program's total time (Total time/(ON_time+OFF_time))
+        uint8_t rampUp;             // [ds] depends on the muscle and exercise, typically below 2s.(pp. 89, Chap 6)
+        uint8_t rampDown;           // [ds]
+        uint8_t electrode1;
+        uint8_t electrode2;
+        uint8_t electrode3;
+        uint8_t electrode4;
+    }params;
+}NEMS_PROGRAM_T;
+
+typedef struct
+{
+    uint16_t noOfClocksPerPulse;    //number of timer interrupts before a pulse is sent    
+    uint16_t clockIndex;            // clock counter 
+    uint16_t pulseIndex;            // pulse index
+    uint16_t pulseIndex2;
+//    uint16_t currentPulseIndex;
+    
+    uint8_t  posPhaseNoOfTicks;
+    uint8_t  silencePhaseNoOfTicks;
+    uint8_t  negPhaseNoOfTicks;
+    uint16_t restPhaseNoOfTicks;
+    uint16_t onTime;                // Number of pulses during ramp up and on time together //during ON_time    
+    uint16_t offTime;               // Number of pulses during ramp_up, on time, ramp down and off time together //during OFF_time
+    
+    uint8_t programAmplitude;
+    uint8_t pulseAmplitude;
+    uint8_t symmetryDivider;
+    uint8_t currentAmplitude;       // current used amplitude
+    
+    uint8_t programAmplitude2;
+    uint8_t pulseAmplitude2;
+    
+    uint8_t rampUpAmplitude[MAX_NO_OF_RAMP_PULSES];
+    uint8_t rampUpAmplitude2[MAX_NO_OF_RAMP_PULSES];
+    uint8_t rampDownAmplitude[MAX_NO_OF_RAMP_PULSES];
+    uint8_t rampDownAmplitude2[MAX_NO_OF_RAMP_PULSES];
+
+    uint16_t rampUpNoOfPulses;          //Number of pulses for ramp up
+    uint16_t onNoOfPulses;
+    uint16_t rampDownNoOfPulses;        //Number of pulses for ramp down
+    uint16_t offNoOfPulses;
+    
+    uint16_t rampUpTime;
+    uint16_t rampDownTime;
+  
+//    uint8_t rampIndex;
+//    uint8_t noOfContractionsDone;
+    
+    uint8_t electrode1;
+    uint8_t electrode2;
+    uint8_t electrode3;
+    uint8_t electrode4;
+}NEMS_WAVEFORM_T;
+
+typedef enum
+{
+    STATE_PHASE_INIT,
+//    STATE_PHASE_PREPARE_DAC_WRITE,
+  //  STATE_PHASE_WAIT_PREPARE_DAC_WRITE,
+    STATE_PHASE_DIR_1_START_MEASUREMENT,
+    STATE_PHASE_DIR_1,
+    STATE_PHASE_SILENCE,
+    STATE_PHASE_DIR_2_START_MEASUREMENT,
+    STATE_PHASE_DIR_2,
+    STATE_PHASE_REST,
+    STATE_PHASE_IDLE
+}STATE_PHASE_T;
+
+typedef enum
+{
+    STATE_PULSE_RAMP_UP,
+    STATE_PULSE_ON,
+    STATE_PULSE_RAMP_DOWN,
+    STATE_PULSE_OFF,
+    STATE_PULSE_IDLE
+}STATE_PULSE_T;
+
+typedef enum
+{
+    STATE_MEASURE_IMU_IDLE,
+    STATE_MEASURE_IMU_OUT_X,
+    STATE_MEASURE_IMU_OUT_Y,
+    STATE_MEASURE_IMU_OUT_Z
+}STATE_MEASURE_IMU_T;
+
+typedef enum
+{
+    STATE_MEASURE_ELECTRODES_INIT,
+    STATE_MEASURE_ELECTRODE_PLUS,
+    STATE_MEASURE_ELECTRODE_MINUS,
+    STATE_MEASURE_ELECTRODES_IDLE
+}STATE_MEASURE_ELECTRODES_T;
+
+typedef enum
+{
+    STATE_MEASURE_STRAIN_GAUGES_INIT,
+    STATE_MEASURE_STRAIN_GAUGE_1,
+    STATE_MEASURE_STRAIN_GAUGE_2,
+    STATE_MEASURE_STRAIN_GAUGES_PRINT_DATA,
+    STATE_MEASURE_STRAIN_GAUGES_IDLE
+}STATE_MEASURE_STRAIN_GAUGES_T;
+
+typedef enum
+{
+    STATE_CONTACT_SCAN_INIT,
+    STATE_CONTACT_SCAN_SET_DIR_1,
+    STATE_CONTACT_SCAN_WAIT_MEASURE_DIR_1,
+    STATE_CONTACT_SCAN_MEASURE_ELECTRODES_DIR_1,
+    STATE_CONTACT_SCAN_SET_DIR_2,
+    STATE_CONTACT_SCAN_WAIT_MEASURE_DIR_2,
+    STATE_CONTACT_SCAN_MEASURE_ELECTRODES_DIR_2,
+    STATE_CONTACT_SCAN_MEASURE_ELECTRODE_CALC_VALS,
+    STATE_CONTACT_SCAN_FINISH,
+    STATE_CONTACT_SCAN_DISCARD,
+    STATE_CONTACT_SCAN_IDLE
+}STATE_CONTACT_SCAN_T;
+
+typedef enum
+{
+    STOP_TREATMENT_IDLE,
+    STOP_TREATMENT_STEP_1,
+    STOP_TREATMENT_STEP_2
+}STOP_TREATMENT_T;
+
+typedef enum
+{
+    STATE_BATT_CHRG_LED_1,
+    STATE_BATT_CHRG_LED_2,
+    STATE_BATT_CHRG_LED_3,
+    STATE_BATT_CHRG_LED_4,
+    STATE_BATT_CHRG_LED_5
+}STATE_BATT_CHRG_LED_T;
+
+/*typedef enum
+{
+    SET_DAC_VALUE_IDLE,
+    SET_DAC_VALUE_CLEAR,
+    SET_DAC_VALUE_CURRENT_AMP
+}SET_DAC_VALUE_T;
+*/
+static STATE_PHASE_T statePhase;
+static STATE_PULSE_T statePulse;
+static STATE_MEASURE_IMU_T stateMeasureIMU;
+static STATE_MEASURE_ELECTRODES_T stateMeasureElectrodes;
+static STATE_MEASURE_STRAIN_GAUGES_T stateMeasureStrainGauges;
+static STATE_CONTACT_SCAN_T stateContactScan;
+static bool commandOngoing;
+static bool electrodeADValReady;
+static bool electrodeMeasurementsFinished;
+static bool strainGaugeADValReady;
+static bool strainGaugeMeasurementsFinished;
+static bool strainGaugeMeasurementsOngoing;
+static bool imuMeasurementsOngoing;
+static uint16_t treatmentADValDir1Plus;
+static uint16_t treatmentADValDir1Minus;
+static uint16_t treatmentADValDir2Plus;
+static uint16_t treatmentADValDir2Minus;
+static uint8_t contactScanValBuf[2 * NO_OF_ELECTRODES];
+static uint16_t contactScanValBufU16[NO_OF_ELECTRODES];
+static int16_t contactScanVoltDir1[NO_OF_ELECTRODES - 1];
+static uint16_t contactScanCurrDir1[NO_OF_ELECTRODES - 1];
+static uint16_t contactScanVoltDir2[NO_OF_ELECTRODES - 1];
+static uint16_t contactScanCurrDir2[NO_OF_ELECTRODES - 1];
+static uint32_t contactScanResistanceDir1[NO_OF_ELECTRODES - 1];
+static uint32_t contactScanResistanceDir2[NO_OF_ELECTRODES - 1];
+static uint16_t electrodeADValPlus;
+static uint16_t electrodeADValMinus;
+static uint16_t strainGauge1ADVal;
+static uint16_t strainGauge2ADVal;
+static NEMS_PROGRAM_T program;
+static NEMS_WAVEFORM_T waveform;
+static bool treatmentOngoing;
+static bool battChrgOngoing;
+static bool adcValueReady;
+//static uint16_t ADCBufferCh4[8];
+#ifndef MEASURE_STRAIN_GAUGE
+static uint16_t ADCBufferStrainGauges[8];
+static uint16_t ADCBufferCh5[8];
+#endif
+static ADC1_CHANNEL ch;
+static uint16_t tickCntr;
+static uint16_t tickCntrLEDBlink;
+static uint16_t pulseCntr;
+static uint8_t contractionCntr;
+static bool runPulseStateMachine;
+//static SET_DAC_VALUE_T setDACValue2;
+static STOP_TREATMENT_T stopTreatment;
+static bool seEnabled;
+static uint8_t freqMultiplier;
+static bool channelControl;
+static uint8_t seIndex;
+static uint8_t seChannel;
+static uint8_t strainGaugeValBuf[SIZE_OF_STRAIN_GAUGE_VAL_BUF];
+
+static void (*electrodes[NO_OF_ELECTRODES])(STATE_ELECTRODE_T);
+
+
+#if 0
+static void DACHdl(void)
+{
+    if(setDACValue2 == SET_DAC_VALUE_CLEAR)
+    {
+        setDACValue2 = SET_DAC_VALUE_IDLE;
+        DACSetValue(0);
+    }
+    else if(setDACValue2 == SET_DAC_VALUE_CURRENT_AMP)
+    {
+        setDACValue2 = SET_DAC_VALUE_IDLE;
+        DACSetValue(waveform.currentAmplitude);
+    }
+    else
+    {
+        // etDACValue is SET_DAC_VALUE_IDLE, don't change value
+    }
+}
+#endif
+
+// Calculate a new amplitude (DAC value)
+// This state machine is run at the start of a program and right after the "negative" pulse
+static void PulseStateMachine(void)
+{
+    bool setDACValue = false;
+
+    pulseCntr++;
+
+    switch(statePulse)
+    {
+    case STATE_PULSE_RAMP_UP:
+        if(pulseCntr <= waveform.rampUpNoOfPulses)
+        {
+            // Set new ramp amplitude
+            //LATAbits.LATA4 = 1;     // Just for debug to see  where in the pulse the program is, LED-indication
+            //LATAbits.LATA7 = 0;     // Just for debug to see  where in the pulse the program is, LED-indication
+            waveform.currentAmplitude = waveform.rampUpAmplitude[pulseCntr - 1];
+            setDACValue = true;
+        }
+        else
+        {
+            // Set on amplitude
+            //LATAbits.LATA4 = 0;     // Just for debug to see  where in the pulse the program is, LED-indication
+            //LATAbits.LATA5 = 1;     // Just for debug to see  where in the pulse the program is, LED-indication
+            pulseCntr = 1;
+            waveform.currentAmplitude = waveform.programAmplitude;
+            setDACValue = true;
+            statePulse = STATE_PULSE_ON;
+        }
+        break;
+
+    case STATE_PULSE_ON:
+        if(pulseCntr > waveform.onNoOfPulses)
+        {
+            // It's time to change states, either to ramp down or off
+            //LATAbits.LATA5 = 0;     // Just for debug to see  where in the pulse the program is, LED-indication
+            pulseCntr = 1;
+            
+            if(waveform.rampDownNoOfPulses > 0)
+            {
+                //LATAbits.LATA6 = 1;     // Just for debug to see  where in the pulse the program is, LED-indication
+                waveform.currentAmplitude = waveform.rampDownAmplitude[0];
+                statePulse = STATE_PULSE_RAMP_DOWN;
+            }
+            else
+            {
+                // No ramping down is used
+                //LATAbits.LATA7 = 1;     // Just for debug to see  where in the pulse the program is, LED-indication
+                waveform.currentAmplitude = 0;
+                statePulse = STATE_PULSE_OFF;
+            }
+
+            setDACValue = true;
+        }
+        //setDACValue = true;
+        break;
+
+    case STATE_PULSE_RAMP_DOWN:
+        if(pulseCntr <= waveform.rampDownNoOfPulses)
+        {
+            // Set new ramp amplitude
+            waveform.currentAmplitude = waveform.rampDownAmplitude[pulseCntr - 1];
+        }
+        else
+        {
+            // Set amplitude to zero
+            //LATAbits.LATA6 = 0;     // Just for debug to see  where in the pulse the program is, LED-indication
+            //LATAbits.LATA7 = 1;     // Just for debug to see  where in the pulse the program is, LED-indication
+            pulseCntr = 1;
+            waveform.currentAmplitude = 0;
+            statePulse = STATE_PULSE_OFF;
+        }
+
+        setDACValue = true;
+        break;
+
+    case STATE_PULSE_OFF:
+        if(pulseCntr > waveform.offNoOfPulses)
+        {
+            // It's time to change states
+            // Increment no of contractions
+            //if(++waveform.noOfContractionsDone < program.params.contractions)
+            if(++contractionCntr < program.params.contractions)
+            {
+                //LATAbits.LATA7 = 0;     // Just for debug to see  where in the pulse the program is, LED-indication
+                pulseCntr = 1;
+
+                if(waveform.rampUpNoOfPulses > 0)
+                {
+                    //LATAbits.LATA4 = 1;     // Just for debug to see  where in the pulse the program is, LED-indication
+                    waveform.currentAmplitude = waveform.rampUpAmplitude[0];
+                    statePulse = STATE_PULSE_RAMP_UP;
+                }
+                else
+                {
+                    //LATAbits.LATA5 = 1;     // Just for debug to see  where in the pulse the program is, LED-indication
+                    waveform.currentAmplitude = waveform.programAmplitude;
+                    statePulse = STATE_PULSE_ON;
+                }
+
+                setDACValue = true;
+            }
+            else
+            {
+                stopTreatment = STOP_TREATMENT_STEP_1;
+                //TMR1_Stop();
+                //LATAbits.LATA7 = 0;     // Just for debug to see  where in the pulse the program is, LED-indication
+                statePulse = STATE_PULSE_IDLE;
+            }
+        }
+        break;
+
+    case STATE_PULSE_IDLE:
+        break;
+        
+    }
+    
+    if(setDACValue == true)
+    {
+        DACSetValue(waveform.currentAmplitude);
+        //setDACValue2 = SET_DAC_VALUE_CLEAR;
+        //DACSetValue(0);
+    }
+}
+
+static void PulseHdl(void)
+{
+    if(runPulseStateMachine == true)
+    {
+        runPulseStateMachine = false;
+        PulseStateMachine();
+    }
+}
+
+void Timer1PhaseStateMachineCb(void)
+{
+    static bool electrodeADValsSaved = false;
+    static bool makePulses = true;
+    tickCntr++;
+
+    // The LED should be blinking when a program is running, on for a short period
+    if(++tickCntrLEDBlink <= LED_ON_TICKS)
+    {
+        // The LED is turned on when the signal goes low
+        LED1_IO_RF0_SetLow();
+    }
+    else
+    {
+        // The LED is turned off when the signal goes high
+        LED1_IO_RF0_SetHigh();
+
+        if(tickCntrLEDBlink >= LED_CLEAR_CNTR_TICKS)
+        {
+            tickCntrLEDBlink = 0;
+        }
+    }
+    
+    switch(statePhase)
+    { 
+    case STATE_PHASE_INIT:
+        makePulses = true;
+        (*electrodes[program.params.electrode1])(STATE_ELECTRODE_POS);      //Set the negative value first
+        (*electrodes[program.params.electrode2])(STATE_ELECTRODE_GND);
+        IO_HIGH_ELECTRODE_EN_SetHigh();
+        tickCntr = 0;
+        //setDACValue2 = SET_DAC_VALUE_CURRENT_AMP;
+        statePhase = STATE_PHASE_DIR_1_START_MEASUREMENT;
+        break;
+
+    case STATE_PHASE_DIR_1_START_MEASUREMENT:
+        // After one tick, start AD measurements of the two sides of the electrode (if a pulse is active)
+        if(makePulses == true)
+        {
+            stateMeasureElectrodes = STATE_MEASURE_ELECTRODES_INIT;
+        }
+        
+        statePhase = STATE_PHASE_DIR_1;
+        break;
+        
+    case STATE_PHASE_DIR_1:
+        if(makePulses == true && electrodeMeasurementsFinished == true)
+        {
+            electrodeMeasurementsFinished = false;
+            treatmentADValDir1Plus = electrodeADValPlus;
+            treatmentADValDir1Minus = electrodeADValMinus;
+            electrodeADValsSaved = true;
+        }
+
+        // Make sure that the AD-conversions are finished before going to next state
+        if((tickCntr >= waveform.posPhaseNoOfTicks && electrodeADValsSaved == true) ||
+           (tickCntr >= waveform.posPhaseNoOfTicks && makePulses == false))
+        {
+            tickCntr = 0;
+            electrodeADValsSaved = false;
+            
+            // If the treatment program is in the off-state (or idle-state), then there should be no pulses
+            if(makePulses == true)
+            {
+                IO_HIGH_ELECTRODE_EN_SetLow();
+                (*electrodes[program.params.electrode1])(STATE_ELECTRODE_TRISTATE);
+                (*electrodes[program.params.electrode2])(STATE_ELECTRODE_TRISTATE);
+                //setDACValue = SET_DAC_VALUE_CLEAR;
+            }
+            
+            statePhase = STATE_PHASE_SILENCE;
+        } 
+        break;
+
+    case STATE_PHASE_SILENCE:
+        if(tickCntr >= waveform.silencePhaseNoOfTicks)
+        {
+            tickCntr = 0;
+    
+            // If the treatment program is in the off-state (or idle-state), then there should be no pulses
+            if(makePulses == true)
+            {
+                (*electrodes[program.params.electrode1])(STATE_ELECTRODE_GND);      //Set the negative value first
+                (*electrodes[program.params.electrode2])(STATE_ELECTRODE_POS);
+                IO_HIGH_ELECTRODE_EN_SetHigh();
+                //setDACValue = SET_DAC_VALUE_CURRENT_AMP;
+            }
+            
+            statePhase = STATE_PHASE_DIR_2_START_MEASUREMENT;
+        }
+        break;
+
+    case STATE_PHASE_DIR_2_START_MEASUREMENT:
+        // After one tick, start AD measurements of the two sides of the electrode (if a pulse is active)
+        if(makePulses == true)
+        {
+            stateMeasureElectrodes = STATE_MEASURE_ELECTRODES_INIT;
+        }
+        
+        statePhase = STATE_PHASE_DIR_2;
+        break;
+        
+    case STATE_PHASE_DIR_2:
+        if(makePulses == true && electrodeMeasurementsFinished == true)
+        {
+            electrodeMeasurementsFinished = false;
+            treatmentADValDir2Plus = electrodeADValPlus;
+            treatmentADValDir2Minus = electrodeADValMinus;
+            electrodeADValsSaved = true;
+        }
+
+        // Make sure that the AD-conversions are finished before going to next state
+        if((tickCntr >= waveform.posPhaseNoOfTicks && electrodeADValsSaved == true) ||
+           (tickCntr >= waveform.posPhaseNoOfTicks && makePulses == false))
+        {
+             // The active part of the pulse is finished. Calculate a new amplitude here, and write it to the DAC so it is ready when the next pulse starts.
+            tickCntr = 0;
+            electrodeADValsSaved = false;
+            runPulseStateMachine = true;        // To calculate new amplitude
+
+            // If the treatment program is in the off-state (or idle-state), then there should be no pulses
+            if(makePulses == true)
+            {
+                ////Let electrode 1 keep its grounded value
+                IO_HIGH_ELECTRODE_EN_SetLow();
+                (*electrodes[program.params.electrode1])(STATE_ELECTRODE_TRISTATE);
+                (*electrodes[program.params.electrode2])(STATE_ELECTRODE_TRISTATE);
+                //setDACValue2 = SET_DAC_VALUE_CLEAR;
+            }
+            
+            statePhase = STATE_PHASE_REST;
+        }
+       break;
+
+    case STATE_PHASE_REST:
+        //---------------------------------------------
+        // Do something with the 4 AD-values
+        //---------------------------------------------
+        
+        if(stopTreatment == STOP_TREATMENT_STEP_1)
+        {
+            statePhase = STATE_PHASE_IDLE;
+            stopTreatment = STOP_TREATMENT_STEP_2;      // Set this to finish everything that is needed can't do everything in the timer interrupt
+        }
+        else if(tickCntr >= waveform.restPhaseNoOfTicks)
+        {
+            tickCntr = 0;
+
+            // If the treatment program is in the off-state (or idle-state), then there should be no pulses
+            if(statePulse != STATE_PULSE_OFF && statePulse != STATE_PULSE_IDLE)
+            {
+                makePulses = true;
+                (*electrodes[program.params.electrode1])(STATE_ELECTRODE_POS);
+                (*electrodes[program.params.electrode2])(STATE_ELECTRODE_GND);
+                IO_HIGH_ELECTRODE_EN_SetHigh();
+                //setDACValue2 = SET_DAC_VALUE_CURRENT_AMP;
+            }
+            else
+            {
+                makePulses = false;
+            }
+            
+            statePhase = STATE_PHASE_DIR_1_START_MEASUREMENT;//STATE_PHASE_DIR_1;
+            //statePhase = STATE_PHASE_PREPARE_DAC_WRITE;//STATE_PHASE_DIR_1;
+        }
+        break;
+
+    case STATE_PHASE_IDLE:
+        break;
+        
+    default:
+        break;
+    }
+}
+
+void Timer1ContactScanCb(void)
+{
+    tickCntr++;
+ }
+
+void Timer2Cb(void)
+{
+    if(imuMeasurementsOngoing == true)
+        stateMeasureIMU = STATE_MEASURE_IMU_OUT_X;
+    else
+        stateMeasureStrainGauges = STATE_MEASURE_STRAIN_GAUGES_INIT;
+}
+
+// Callback function used when there are set number of ADconversions ready
+void ADCValuesCb(void)
+{
+ //   ADC1_ConversionResultGet(ADCBuffer);
+    ADC1_InterruptFlagClear();
+    adcValueReady = true;
+}
+
+void PrintElectrodeADValues(uint16_t *values, uint8_t noOfValues)
+{
+    for(int i = 0; i < noOfValues; i++)
+    {
+        int8_t buf[10];
+        itoaU16(values[i], buf);
+
+        if(values[i] > 999)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+            UART2_Write(buf[3]);
+        }
+        else if(values[i] > 99)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+        }
+        else if(values[i] > 9)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+        }
+        else
+        {
+            UART2_Write(buf[0]);
+        }
+
+        UART2_Write(' ');
+    }
+}
+
+void PrintElectrodeVoltages(uint32_t *values, uint8_t noOfValues)
+{
+    for(int i = 0; i < noOfValues; i++)
+    {
+        int8_t buf[10];
+        uint32_t val = values[i];
+        itoaU32(val, buf);
+
+        if(val > 999999999)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+            UART2_Write(buf[3]);
+            UART2_Write(buf[4]);
+            UART2_Write(buf[5]);
+            UART2_Write(buf[6]);
+            UART2_Write(buf[7]);
+            UART2_Write(buf[8]);
+            UART2_Write(buf[9]);
+        }
+        else if(values[i] > 99999999)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+            UART2_Write(buf[3]);
+            UART2_Write(buf[4]);
+            UART2_Write(buf[5]);
+            UART2_Write(buf[6]);
+            UART2_Write(buf[7]);
+            UART2_Write(buf[8]);
+        }
+        else if(values[i] > 9999999)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+            UART2_Write(buf[3]);
+            UART2_Write(buf[4]);
+            UART2_Write(buf[5]);
+            UART2_Write(buf[6]);
+            UART2_Write(buf[7]);
+        }
+        else if(values[i] > 999999)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+            UART2_Write(buf[3]);
+            UART2_Write(buf[4]);
+            UART2_Write(buf[5]);
+            UART2_Write(buf[6]);
+        }
+        else if(values[i] > 99999)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+            UART2_Write(buf[3]);
+            UART2_Write(buf[4]);
+            UART2_Write(buf[5]);
+        }
+        else if(values[i] > 9999)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+            UART2_Write(buf[3]);
+            UART2_Write(buf[4]);
+        }
+        else if(values[i] > 999)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+            UART2_Write(buf[3]);
+        }
+        else if(values[i] > 99)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+        }
+        else if(values[i] > 9)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+        }
+        else
+        {
+            UART2_Write(buf[0]);
+        }
+
+        UART2_Write(' ');
+        
+        for(int i = 0; i < 10000; i++)
+            ;
+    }
+}
+
+/* This state machine sends only current in one direction. Should current be sent in both directions here too? */
+static void StateContactScanHdl(void)
+{
+    static uint8_t electrodeCntr = 0;
+//    static uint8_t contactScanValIndex = 0;
+  //  static uint8_t contactScanValIndexU16 = 0;
+    //static uint16_t contactScanVal;
+    static uint16_t contactScanADValDir1Plus = 0;
+    static uint16_t contactScanADValDir1Minus = 0;
+    static uint16_t contactScanADValDir2Plus = 0;
+    static uint16_t contactScanADValDir2Minus = 0;
+    static uint8_t noOfMeasurements = 0;
+    
+    switch(stateContactScan)
+    {
+    case STATE_CONTACT_SCAN_INIT:
+        DCDC_ENABLE_IO_RF1_SetHigh();
+        TMR1_SetInterruptHandler(&Timer1ContactScanCb);     // Redirect to another callback that handles contact scanning, still interrupts at 50 us (20 kHz)
+        DACSetValue(CONTACT_SCAN_AMPLITUDE_MILLI_A);        // Set amplitude
+        
+        // Wait a little?
+        
+        TMR1_Counter16BitSet(0);                            // Clear the counter
+        TMR1_Start();                                       // Start scanning timer
+        stateContactScan = STATE_CONTACT_SCAN_SET_DIR_1;
+        break;
+
+    case STATE_CONTACT_SCAN_SET_DIR_1:
+        electrodeCntr++;
+        (*electrodes[0])(STATE_ELECTRODE_POS);
+        (*electrodes[electrodeCntr])(STATE_ELECTRODE_GND);
+        //for(uint16_t i = 0; i < 1000; i++)
+          //  ;
+        IO_LOW_ELECTRODE_EN_SetHigh();
+        tickCntr = 0;
+        stateContactScan = STATE_CONTACT_SCAN_WAIT_MEASURE_DIR_1;
+        break;
+
+    case STATE_CONTACT_SCAN_WAIT_MEASURE_DIR_1:
+        if(tickCntr >= CONTACT_SCAN_NO_OF_TICKS)
+        {
+            // The signal should have stabilized, measure
+            stateMeasureElectrodes = STATE_MEASURE_ELECTRODES_INIT;
+            stateContactScan = STATE_CONTACT_SCAN_MEASURE_ELECTRODES_DIR_1;
+        }
+        break;
+
+    case STATE_CONTACT_SCAN_MEASURE_ELECTRODES_DIR_1:
+        if(electrodeMeasurementsFinished == true)
+        {
+            electrodeMeasurementsFinished = false;
+            contactScanADValDir1Plus += electrodeADValPlus;
+            contactScanADValDir1Minus += electrodeADValMinus;
+            
+            if(++noOfMeasurements < CONTACT_SCAN_NO_OF_CONV)
+            {
+                stateMeasureElectrodes = STATE_MEASURE_ELECTRODES_INIT;
+                // Stay in current state
+            }
+            else
+            {
+                IO_LOW_ELECTRODE_EN_SetLow();
+//                for(uint16_t i = 0; i < 1000; i++)
+  //                  ;
+                (*electrodes[0])(STATE_ELECTRODE_TRISTATE);
+                (*electrodes[electrodeCntr])(STATE_ELECTRODE_TRISTATE);
+    //            for(uint16_t i = 0; i < 1000; i++)
+      //              ;
+                noOfMeasurements = 0;
+                stateContactScan = STATE_CONTACT_SCAN_SET_DIR_2;
+            }
+        }
+        break;
+
+    case STATE_CONTACT_SCAN_SET_DIR_2:
+        (*electrodes[0])(STATE_ELECTRODE_GND);
+        (*electrodes[electrodeCntr])(STATE_ELECTRODE_POS);
+
+//        for(uint16_t i = 0; i < 1000; i++)
+  //          ;
+
+        IO_LOW_ELECTRODE_EN_SetHigh();
+        tickCntr = 0;
+        stateContactScan = STATE_CONTACT_SCAN_WAIT_MEASURE_DIR_2;
+        break;
+
+    case STATE_CONTACT_SCAN_WAIT_MEASURE_DIR_2:
+        if(tickCntr >= CONTACT_SCAN_NO_OF_TICKS)
+        {
+            // The signal should have stabilized, measure
+            stateMeasureElectrodes = STATE_MEASURE_ELECTRODES_INIT;
+            stateContactScan = STATE_CONTACT_SCAN_MEASURE_ELECTRODES_DIR_2;
+        }
+        break;
+
+    case STATE_CONTACT_SCAN_MEASURE_ELECTRODES_DIR_2:
+        if(electrodeMeasurementsFinished == true)
+        {
+            electrodeMeasurementsFinished = false;
+            contactScanADValDir2Plus += electrodeADValPlus;
+            contactScanADValDir2Minus += electrodeADValMinus;
+
+            if(++noOfMeasurements < CONTACT_SCAN_NO_OF_CONV)
+            {
+                stateMeasureElectrodes = STATE_MEASURE_ELECTRODES_INIT;
+                // Stay in current state
+            }
+            else
+            {
+                IO_LOW_ELECTRODE_EN_SetLow();
+//                for(uint16_t i = 0; i < 1000; i++)
+  //                  ;
+                (*electrodes[0])(STATE_ELECTRODE_TRISTATE);
+                (*electrodes[electrodeCntr])(STATE_ELECTRODE_TRISTATE);
+    //            for(uint16_t i = 0; i < 1000; i++)
+      //              ;
+                noOfMeasurements = 0;
+                stateContactScan = STATE_CONTACT_SCAN_MEASURE_ELECTRODE_CALC_VALS;
+            }
+        }
+        break;
+            
+    case STATE_CONTACT_SCAN_MEASURE_ELECTRODE_CALC_VALS:
+        {
+            int32_t temp;
+            double fTemp = 0.0;
+
+            // Calculate the difference in voltage that lies between the patches (between plus and minus), store in "plus array"
+            // AD-value range is 0 -> 1023. 1023 corresponds to 3.3 V, or 3300 mV
+            fTemp = (double)(contactScanADValDir1Plus + contactScanADValDir2Plus) * 11.85106;
+            fTemp -= (double)(contactScanADValDir1Minus + contactScanADValDir2Minus);
+            fTemp *= 3300;
+            fTemp /= CONTACT_SCAN_NO_OF_CONV * 2;
+            fTemp /= 1023;
+            
+  /*          temp = (int32_t)contactScanADValDir1Plus - (int32_t)contactScanADValDir1Minus;
+            temp /= CONTACT_SCAN_NO_OF_CONV;
+            temp *= 3300;
+            temp /= 1023;*/
+            contactScanVoltDir1[electrodeCntr - 1] = (uint16_t)fTemp;
+
+/*            fTemp = (double)contactScanADValDir2Plus * 11.85106;
+            fTemp -= (double)contactScanADValDir2Minus;
+            fTemp *= 3300;
+            fTemp /= CONTACT_SCAN_NO_OF_CONV;
+            fTemp /= 1023;
+//            temp = (((double)(contactScanADValDir2Plus - contactScanADValDir2Minus)) / CONTACT_SCAN_NO_OF_CONV) * 3300 / 1023;
+            contactScanVoltDir2[electrodeCntr - 1] = (uint16_t)fTemp;
+*/
+            // The minus AD-values can be used to calculate the current through the patches
+            // AD-value range is 0 -> 1023. 1023 corresponds to 3.3 V, or 3300 mV
+            // This voltage lies over a 1.5 kOhm resistor, calculate the current flowing through the resistor
+            // Max current is 3.3 V / 1500 ohm = 0.0022 A = 2.2 mA = 2200 uA. Values stored in "minus array" are in unit uA.
+            temp = ((((double)contactScanADValDir1Minus / CONTACT_SCAN_NO_OF_CONV) * 3300) / 1023) / 1.5;
+            contactScanCurrDir1[electrodeCntr - 1] = (uint16_t)temp;
+  /*          temp = ((((double)contactScanADValDir2Minus / CONTACT_SCAN_NO_OF_CONV) * 3300) / 1023) / 1.5;
+            contactScanCurrDir2[electrodeCntr - 1] = (uint16_t)temp;
+*/
+            // Calculate the resistance of the body  between the patches, U / I = R
+            // U [mV], I [uA] -> mult with 1000 to get ohm
+            fTemp = (double)contactScanVoltDir1[electrodeCntr - 1] / (double)contactScanCurrDir1[electrodeCntr - 1];
+            contactScanResistanceDir1[electrodeCntr - 1] = (uint32_t)(fTemp * 1000);
+  /*          fTemp = (double)contactScanVoltDir2[electrodeCntr - 1] / (double)contactScanCurrDir2[electrodeCntr - 1];
+            contactScanResistanceDir2[electrodeCntr - 1] = (uint32_t)(fTemp * 1000);
+*/
+            contactScanADValDir1Plus = 0;
+            contactScanADValDir1Minus = 0;
+            contactScanADValDir2Plus = 0;
+            contactScanADValDir2Minus = 0;
+
+            if(electrodeCntr < 31)
+            {
+                stateContactScan = STATE_CONTACT_SCAN_SET_DIR_1;
+            }
+            else
+            {
+                stateContactScan = STATE_CONTACT_SCAN_FINISH;
+            }
+        }
+        break;
+
+    case STATE_CONTACT_SCAN_FINISH:
+        electrodeCntr = 0;
+        noOfMeasurements = 0;
+        DCDC_ENABLE_IO_RF1_SetLow();        // Not needed?!
+        TMR1_Stop();
+        TMR1_SetInterruptHandler(&Timer1PhaseStateMachineCb);
+        DACSetValue(0);
+
+/*            PutConstString("Volt body dir 1: ");
+        PrintElectrodeADValues(contactScanADValDir1Plus, NO_OF_ELECTRODES - 1);
+        PutConstString("\n\rCurr dir 1: ");
+        PrintElectrodeADValues(contactScanADValDir1Minus, NO_OF_ELECTRODES - 1);
+        PutConstString("\n\rVolt body dir 2: ");
+        PrintElectrodeADValues(contactScanADValDir2Plus, NO_OF_ELECTRODES - 1);
+        PutConstString("\n\rCurr dir 2: "); 
+        PrintElectrodeADValues(contactScanADValDir2Minus, NO_OF_ELECTRODES - 1);*/
+        PutConstString("\n\rRes body: ");
+        for(uint8_t i = 0; i < 31; i++)
+        {
+            uint32_t val = contactScanResistanceDir1[i];
+            PrintElectrodeVoltages(&val, 1);
+        }
+/*        PutConstString("\n\rRes body dir 2: ");
+        for(uint8_t i = 0; i < 31; i++)
+        {
+            uint32_t val = contactScanResistanceDir2[i];
+            PrintElectrodeVoltages(&val, 1);
+        }*/
+        //PrintElectrodeVoltages(contactScanResistanceDir2, NO_OF_ELECTRODES - 1);
+        PutConstString("\n\r\n\r");
+
+        commandOngoing = false;
+        stateContactScan = STATE_CONTACT_SCAN_IDLE;
+        break;
+
+    case STATE_CONTACT_SCAN_DISCARD:
+        IO_LOW_ELECTRODE_EN_SetLow();
+        for(uint16_t i = 0; i < 100; i++)
+            ;
+        (*electrodes[0])(STATE_ELECTRODE_TRISTATE);
+        (*electrodes[electrodeCntr])(STATE_ELECTRODE_TRISTATE);
+        DCDC_ENABLE_IO_RF1_SetLow();
+        TMR1_Stop();
+        TMR1_SetInterruptHandler(&Timer1PhaseStateMachineCb);
+        DACSetValue(0);
+
+        electrodeCntr = 0;
+        noOfMeasurements = 0;
+        contactScanADValDir1Plus = 0;
+        contactScanADValDir1Minus = 0;
+        contactScanADValDir2Plus = 0;
+        contactScanADValDir2Minus = 0;
+        
+        commandOngoing = false;
+        stateContactScan = STATE_CONTACT_SCAN_IDLE;
+        break;
+            
+    case STATE_CONTACT_SCAN_IDLE:
+        break;
+
+    default:
+        break;
+    }
+}
+#if 0
+/* This state machine sends only current in one direction. Should current be sent in both directions here too? */
+static void StateContactScanHdl(void)
+{
+    static uint8_t electrodeCntr = 0;
+//    static uint8_t contactScanValIndex = 0;
+  //  static uint8_t contactScanValIndexU16 = 0;
+    //static uint16_t contactScanVal;
+    static uint16_t contactScanValDir1PlusTemp = 0;
+    static uint16_t contactScanValDir1MinusTemp = 0;
+    static uint16_t contactScanValDir2PlusTemp = 0;
+    static uint16_t contactScanValDir2MinusTemp = 0;
+    static uint8_t noOfMeasurements = 0;
+    
+    switch(stateContactScan)
+    {
+    case STATE_CONTACT_SCAN_INIT:
+        DCDC_ENABLE_IO_RF1_SetHigh();
+        TMR1_SetInterruptHandler(&Timer1ContactScanCb);     // Redirect to another callback that handles contact scanning, still interrupts at 50 us (20 kHz)
+        DACSetValue(CONTACT_SCAN_AMPLITUDE_MILLI_A);        // Set amplitude
+        
+        // Wait a little?
+        
+        TMR1_Counter16BitSet(0);                            // Clear the counter
+        TMR1_Start();                                       // Start scanning timer
+        stateContactScan = STATE_CONTACT_SCAN_SET_DIR_1;
+        //stateContactScan = STATE_CONTACT_SCAN_SET_OUTPUT;
+        break;
+
+    case STATE_CONTACT_SCAN_SET_DIR_1:
+        electrodeCntr++;
+        (*electrodes[0])(STATE_ELECTRODE_POS);
+        (*electrodes[electrodeCntr])(STATE_ELECTRODE_GND);
+        IO_LOW_ELECTRODE_EN_SetHigh();   
+        tickCntr = 0;
+        stateContactScan = STATE_CONTACT_SCAN_WAIT_MEASURE_DIR_1;
+        break;
+
+    case STATE_CONTACT_SCAN_WAIT_MEASURE_DIR_1:
+        if(tickCntr >= CONTACT_SCAN_NO_OF_TICKS)
+        {
+            // The pulse should have stabilized, measure
+            electrodeADValReady = false;
+            ch = channel_AN3;                                   // Select electrode+ to measure
+            ADC1_ChannelSelect(ch);
+            ADC1_SoftwareTriggerEnable();
+            stateContactScan = STATE_CONTACT_SCAN_MEASURE_ELECTRODE_PLUS_DIR_1;
+        }
+        break;
+
+    case STATE_CONTACT_SCAN_MEASURE_ELECTRODE_PLUS_DIR_1:
+        if(electrodeADValReady == true)
+        {
+            electrodeADValReady = false;
+            contactScanValDir1PlusTemp += ADC1BUF0;
+            /*contactScanValBufU16[contactScanValIndexU16++] = contactScanVal;
+            contactScanValBuf[contactScanValIndex++] = (uint8_t)(contactScanVal & 0xFF);
+            contactScanValBuf[contactScanValIndex++] = (uint8_t)((contactScanVal >> 8) & 0xFF);*/
+            ch = channel_AN4;                                   // Select electrode+ to measure
+            ADC1_ChannelSelect(ch);
+            ADC1_SoftwareTriggerEnable();
+            stateContactScan = STATE_CONTACT_SCAN_MEASURE_ELECTRODE_MINUS_DIR_1;
+        }
+        break;
+            
+    case STATE_CONTACT_SCAN_MEASURE_ELECTRODE_MINUS_DIR_1:
+        if(electrodeADValReady == true)
+        {
+            electrodeADValReady = false;
+            contactScanValDir1MinusTemp += ADC1BUF0;
+            
+            if(++noOfMeasurements < CONTACT_SCAN_NO_OF_CONV)
+            {
+                ch = channel_AN3;                                   // Select electrode+ to measure
+                ADC1_ChannelSelect(ch);
+                ADC1_SoftwareTriggerEnable();
+                stateContactScan = STATE_CONTACT_SCAN_MEASURE_ELECTRODE_PLUS_DIR_1;
+            }
+            else
+            {
+                IO_LOW_ELECTRODE_EN_SetLow();
+                for(uint16_t i = 0; i < 20; i++)
+                    ;
+                (*electrodes[0])(STATE_ELECTRODE_TRISTATE);
+                (*electrodes[electrodeCntr])(STATE_ELECTRODE_TRISTATE);
+                noOfMeasurements = 0;
+                stateContactScan = STATE_CONTACT_SCAN_SET_DIR_2;
+            }
+        }
+        break; 
+            
+    case STATE_CONTACT_SCAN_SET_DIR_2:
+        (*electrodes[0])(STATE_ELECTRODE_GND);
+        (*electrodes[electrodeCntr])(STATE_ELECTRODE_POS);
+        IO_LOW_ELECTRODE_EN_SetHigh();
+        tickCntr = 0;
+        stateContactScan = STATE_CONTACT_SCAN_WAIT_MEASURE_DIR_2;
+        break;
+
+    case STATE_CONTACT_SCAN_WAIT_MEASURE_DIR_2:
+        if(tickCntr >= CONTACT_SCAN_NO_OF_TICKS)
+        {
+            // The pulse should have stabilized, measure
+            electrodeADValReady = false;
+            ch = channel_AN3;                                   // Select electrode+ to measure
+            ADC1_ChannelSelect(ch);
+            ADC1_SoftwareTriggerEnable();
+            stateContactScan = STATE_CONTACT_SCAN_MEASURE_ELECTRODE_PLUS_DIR_2;
+        }
+        break;
+
+    case STATE_CONTACT_SCAN_MEASURE_ELECTRODE_PLUS_DIR_2:
+        if(electrodeADValReady == true)
+        {
+            electrodeADValReady = false;
+            contactScanValDir2PlusTemp += ADC1BUF0;
+            ch = channel_AN4;                                   // Select electrode+ to measure
+            ADC1_ChannelSelect(ch);
+            ADC1_SoftwareTriggerEnable();
+            stateContactScan = STATE_CONTACT_SCAN_MEASURE_ELECTRODE_MINUS_DIR_2;
+        }
+        break;
+            
+    case STATE_CONTACT_SCAN_MEASURE_ELECTRODE_MINUS_DIR_2:
+        if(electrodeADValReady == true)
+        {
+            electrodeADValReady = false;
+            contactScanValDir2MinusTemp += ADC1BUF0;
+            
+            if(++noOfMeasurements < CONTACT_SCAN_NO_OF_CONV)
+            {
+                ch = channel_AN3;                                   // Select electrode+ to measure
+                ADC1_ChannelSelect(ch);
+                ADC1_SoftwareTriggerEnable();
+                stateContactScan = STATE_CONTACT_SCAN_MEASURE_ELECTRODE_PLUS_DIR_2;
+            }
+            else
+            {
+                double tempVal;
+                
+                IO_LOW_ELECTRODE_EN_SetLow();
+                for(uint16_t i = 0; i < 20; i++)
+                    ;
+                (*electrodes[0])(STATE_ELECTRODE_TRISTATE);
+                (*electrodes[electrodeCntr])(STATE_ELECTRODE_TRISTATE);
+                noOfMeasurements = 0;
+
+                // Calculate the difference in voltage the lies between the patches (between plus and minus), store in "plus array"
+                // AD-value range is 0 -> 1023. 1023 corresponds to 3.3 V, or 3300 mV
+                tempVal = (((double)(contactScanValDir1PlusTemp - contactScanValDir1MinusTemp)) / CONTACT_SCAN_NO_OF_CONV) * 3300 / 1023;
+                contactScanValDir1Plus[electrodeCntr - 1] = (uint16_t)tempVal;
+                tempVal = (((double)(contactScanValDir2PlusTemp - contactScanValDir2MinusTemp)) / CONTACT_SCAN_NO_OF_CONV) * 3300 / 1023;
+                contactScanValDir2Plus[electrodeCntr - 1] = (uint16_t)tempVal;
+                
+                // The minus AD-values can be used to calculate the current through the patches
+                // AD-value range is 0 -> 1023. 1023 corresponds to 3.3 V, or 3300 mV
+                // This voltage lies over a 1.5 kOhm resistor, calculate the current flowing through the resistor
+                // Max current is 3.3 V / 1500 ohm = 0.0022 A = 2.2 mA = 2200 uA. Values stored in "minus array" in unit uA.
+                tempVal = ((((double)contactScanValDir1MinusTemp / CONTACT_SCAN_NO_OF_CONV) * 3300) / 1023) / 1.5;
+                contactScanValDir1Minus[electrodeCntr - 1] = (uint16_t)tempVal;
+                tempVal = ((((double)contactScanValDir2MinusTemp / CONTACT_SCAN_NO_OF_CONV) * 3300) / 1023) / 1.5;
+                contactScanValDir2Minus[electrodeCntr - 1] = (uint16_t)tempVal;
+                
+                // Calculate the resistance of the body  between the patches, U / I = R
+                // U [mV], I [uA] -> mult with 1000 to get ohm
+                tempVal = (double)contactScanValDir1Plus[electrodeCntr - 1] / (double)contactScanValDir1Minus[electrodeCntr - 1];
+                contactScanResistanceDir1[electrodeCntr - 1] = (uint32_t)(tempVal * 1000);
+                tempVal = (double)contactScanValDir2Plus[electrodeCntr - 1] / (double)contactScanValDir2Minus[electrodeCntr - 1];
+                contactScanResistanceDir2[electrodeCntr - 1] = (uint32_t)(tempVal * 1000);
+
+                contactScanValDir1PlusTemp = 0;
+                contactScanValDir1MinusTemp = 0;
+                contactScanValDir2PlusTemp = 0;
+                contactScanValDir2MinusTemp = 0;
+
+                if(electrodeCntr < 31)
+                {
+                    stateContactScan = STATE_CONTACT_SCAN_SET_DIR_1;
+                }
+                else
+                {
+                    stateContactScan = STATE_CONTACT_SCAN_FINISH;
+                }
+            }
+        }
+        break;
+
+    case STATE_CONTACT_SCAN_FINISH:
+        electrodeCntr = 0;
+        noOfMeasurements = 0;
+        DCDC_ENABLE_IO_RF1_SetLow();
+        TMR1_Stop();
+        TMR1_SetInterruptHandler(&Timer1PhaseStateMachineCb);
+        DACSetValue(0);
+
+/*            PutConstString("Volt body dir 1: ");
+        PrintElectrodeADValues(contactScanValDir1Plus, NO_OF_ELECTRODES - 1);
+        PutConstString("\n\rCurr dir 1: ");
+        PrintElectrodeADValues(contactScanValDir1Minus, NO_OF_ELECTRODES - 1);
+        PutConstString("\n\rVolt body dir 2: ");
+        PrintElectrodeADValues(contactScanValDir2Plus, NO_OF_ELECTRODES - 1);
+        PutConstString("\n\rCurr dir 2: ");
+        PrintElectrodeADValues(contactScanValDir2Minus, NO_OF_ELECTRODES - 1);*/
+        PutConstString("\n\rRes body dir 1: ");
+        PrintElectrodeVoltages(contactScanResistanceDir1, NO_OF_ELECTRODES - 1);
+        PutConstString("\n\rRes body dir 2: ");
+        PrintElectrodeVoltages(contactScanResistanceDir2, NO_OF_ELECTRODES - 1);
+        PutConstString("\n\r\n\r");
+
+        commandOngoing = false;
+        stateContactScan = STATE_CONTACT_SCAN_IDLE;
+        break;
+
+    case STATE_CONTACT_SCAN_IDLE:
+        break;
+
+    default:
+        break;
+    }
+}
+#endif
+static void GetPacket(uint8_t* param)
+{
+    uint8_t message[2];
+    
+    // Use UART2_IsRxReady() in the real program
+    message[0] = UART2_Read();
+    message[1] = UART2_Read();
+
+    *param = message[0] - '0';
+    *param *= 10;
+    *param += message[1] - '0';
+}
+
+static void GetPacketBinASCII(uint8_t* param)
+{
+    uint8_t message[2];
+    
+    // Use UART2_IsRxReady() in the real program
+    message[0] = UART2_Read();
+    message[1] = UART2_Read();
+
+    if(message[0] == 'B')
+    {
+        *param = message[1];
+    }
+    else
+    {
+        *param = message[0] - '0';
+        *param *= 10;
+        *param += message[1] - '0';
+    }
+}
+
+static void GetPacket3Bytes(uint8_t* param)
+{
+    uint8_t message[3];
+    
+    // Use UART2_IsRxReady() in the real program
+    message[0] = UART2_Read();
+    message[1] = UART2_Read();
+    message[2] = UART2_Read();
+
+    *param = message[0] - '0';
+    *param *= 10;
+    *param += message[1] - '0';
+    *param *= 10;
+    *param += message[2] - '0';
+}
+
+// Set up an array of function pointers where each function handles a single electrode (two processor pins)
+// An electrode can be connected to plus, ground or be tri-stated
+static void InitElectrodes(void)
+{
+    electrodes[0]  = Electrode0;
+    electrodes[1]  = Electrode1;
+    electrodes[2]  = Electrode2;
+    electrodes[3]  = Electrode3;
+    electrodes[4]  = Electrode4;
+    electrodes[5]  = Electrode5;
+    electrodes[6]  = Electrode6;
+    electrodes[7]  = Electrode7;
+    electrodes[8]  = Electrode8;
+    electrodes[9]  = Electrode9;
+    electrodes[10] = Electrode10;
+    electrodes[11] = Electrode11;
+    electrodes[12] = Electrode12;
+    electrodes[13] = Electrode13;
+    electrodes[14] = Electrode14;
+    electrodes[15] = Electrode15;
+    electrodes[16] = Electrode16;
+    electrodes[17] = Electrode17;
+    electrodes[18] = Electrode18;
+    electrodes[19] = Electrode19;
+    electrodes[20] = Electrode20;
+    electrodes[21] = Electrode21;
+    electrodes[22] = Electrode22;
+    electrodes[23] = Electrode23;
+    electrodes[24] = Electrode24;
+    electrodes[25] = Electrode25;
+    electrodes[26] = Electrode26;
+    electrodes[27] = Electrode27;
+    electrodes[28] = Electrode28;
+    electrodes[29] = Electrode29;
+    electrodes[30] = Electrode30;
+    electrodes[31] = Electrode31;
+    
+    for(int i = 0; i < NO_OF_ELECTRODES; i++)
+        (*electrodes[i])(STATE_ELECTRODE_TRISTATE);
+}
+
+static void GetProgram(void)
+{
+    int8_t buf[4];
+
+    PutConstString("amplitude: ");
+    itoaU16((uint16_t)program.params.amplitude, buf);
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+    
+    PutConstString("amplitude2: ");
+    itoaU16((uint16_t)program.params.amplitude2, buf);
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+    
+    PutConstString("frequency: ");
+    itoaU16((uint16_t)program.params.frequency, buf);
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+    
+    PutConstString("phaseNoOfTicks: ");
+    itoaU16((uint16_t)program.params.phaseNoOfTicks, buf);
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+    
+    PutConstString("symmetryFactor: ");
+    itoaU16((uint16_t)program.params.symmetryFactor, buf);
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+    
+    PutConstString("onTime: ");
+    itoaU16((uint16_t)program.params.onTime, buf);
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+    
+    PutConstString("offTime: ");
+    itoaU16((uint16_t)program.params.offTime, buf);
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+    
+    PutConstString("contractions: ");
+    itoaU16((uint16_t)program.params.contractions, buf);
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+    
+    PutConstString("rampUp: ");
+    itoaU16((uint16_t)program.params.rampUp, buf);
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+    
+    PutConstString("rampDown: ");
+    itoaU16((uint16_t)program.params.rampDown, buf);
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+    
+    PutConstString("electrode1: ");
+    itoaU16((uint16_t)program.params.electrode1, buf);
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+    
+    PutConstString("electrode2: ");
+    itoaU16((uint16_t)program.params.electrode2, buf);
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+    
+    PutConstString("electrode3: ");
+    itoaU16((uint16_t)program.params.electrode3, buf);
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+    
+    PutConstString("electrode4: ");
+    itoaU16((uint16_t)program.params.electrode4, buf);
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+}
+
+static void SaveProgram(void)
+{
+//    FT24C08AWriteData((uint8_t*)(&program), 14, 0);
+    BR24T32WriteProgram((uint8_t*)(&program));
+    PutConstString("s-ok ");
+}
+
+static void LoadProgram(void)
+{
+    uint8_t* startAddr;
+//    startAddr = FT24C08AGetProgram();
+    startAddr = BR24T32ReadProgram();
+    
+    for(uint8_t i = 0; i < SIZE_OF_PROGRAM; i++)
+        program.b[i] = *(startAddr +i);
+    
+    PutConstString("l-ok ");
+}
+
+static void CalculateRamp(void)
+{
+    unsigned char i;
+    
+    if(waveform.rampUpNoOfPulses <= MAX_NO_OF_RAMP_PULSES && waveform.rampDownNoOfPulses <= MAX_NO_OF_RAMP_PULSES)
+    {
+        for(i = 0; i < waveform.rampUpNoOfPulses; i++)
+        {
+            waveform.rampUpAmplitude[i]  = (uint16_t)(i * waveform.programAmplitude)  / waveform.rampUpNoOfPulses;
+            waveform.rampUpAmplitude2[i] = (uint16_t)(i * waveform.programAmplitude2) / waveform.rampUpNoOfPulses;
+        }
+
+        for(i = 0; i < waveform.rampDownNoOfPulses; i++)
+        {
+            waveform.rampDownAmplitude[i]  = (uint16_t)((waveform.rampDownNoOfPulses - i - 1) * waveform.programAmplitude)  / waveform.rampDownNoOfPulses;
+            waveform.rampDownAmplitude2[i] = (uint16_t)((waveform.rampDownNoOfPulses - i - 1) * waveform.programAmplitude2) / waveform.rampDownNoOfPulses;
+        }
+    }
+}
+
+static void RecalculateProgram(void)
+{
+    uint8_t seFrequency;
+
+    if(seEnabled == true)
+    {
+        seFrequency = program.params.frequency * freqMultiplier;
+        waveform.noOfClocksPerPulse = (uint16_t)TIMER_FREQUENCY / seFrequency;
+    }
+    else
+    {
+        seFrequency = program.params.frequency;
+        waveform.noOfClocksPerPulse = (uint16_t)TIMER_FREQUENCY / seFrequency;
+        //waveform.noOfClocksPerPulse /= 2; 
+    }
+    
+    waveform.clockIndex = 0;
+    waveform.pulseIndex = 0;
+    waveform.pulseIndex2 = 0;
+    
+    waveform.rampUpNoOfPulses = (program.params.rampUp * seFrequency) / 10;
+    waveform.onNoOfPulses = (program.params.onTime * seFrequency) / 10;
+    waveform.rampDownNoOfPulses = (program.params.rampDown * seFrequency) / 10;
+    waveform.offNoOfPulses = (program.params.offTime * seFrequency) / 10;
+    
+/*    waveform.rampUpTime = waveform.rampUpNoOfPulses;
+    
+    waveform.onTime = program.params.onTime * seFrequency; + waveform.rampUpTime;
+    waveform.rampDownTime = waveform.rampDownNoOfPulses + waveform.onTime;
+    waveform.offTime = program.params.offTime * seFrequency + waveform.onTime;
+  */  
+    waveform.pulseAmplitude = 0;
+    waveform.currentAmplitude = 0;
+    waveform.programAmplitude = program.params.amplitude;
+    
+    waveform.programAmplitude2 = program.params.amplitude2;
+    
+    switch(program.params.symmetryFactor)
+    {
+        case 1: waveform.symmetryDivider = 0; break;
+        case 2: waveform.symmetryDivider = 1; break;
+        case 4: waveform.symmetryDivider = 2; break;
+        case 8: waveform.symmetryDivider = 3; break;
+        default: waveform.symmetryDivider = 0; break;
+    }
+
+    waveform.posPhaseNoOfTicks =  program.params.phaseNoOfTicks;
+    waveform.silencePhaseNoOfTicks = SILENCE_PERIOD;                       //program.params.phaseNoOfTicks + SILENCE_PERIOD;
+    waveform.negPhaseNoOfTicks = program.params.phaseNoOfTicks;     // * program.params.symmetryFactor + program.params.phaseNoOfTicks + SILENCE_PERIOD;
+    waveform.restPhaseNoOfTicks = waveform.noOfClocksPerPulse - (2 * program.params.phaseNoOfTicks + SILENCE_PERIOD);
+
+//    waveform.rampIndex = 0;
+//    waveform.noOfContractionsDone = 0;
+    contractionCntr = 0;
+    
+    waveform.electrode1 = program.params.electrode1;
+    waveform.electrode2 = program.params.electrode2;
+    waveform.electrode3 = program.params.electrode3;
+    waveform.electrode4 = program.params.electrode4;
+    
+    CalculateRamp();
+    
+    //NEMS_states = NEMS_DISABLED;
+    //NEMS_wave_states = NEMS_OFF_TIME;   
+    statePhase = STATE_PHASE_INIT;
+//    statePhase = STATE_PHASE_PREPARE_DAC_WRITE;//STATE_PHASE_INIT;
+    tickCntr = 0;
+    tickCntrLEDBlink = 0;
+
+    statePulse = STATE_PULSE_RAMP_UP;
+    pulseCntr = 0;
+    PulseStateMachine();
+    
+    // Delay function needed to allow DAC value to stabilize?
+    
+    channelControl = 0;
+    
+    seIndex = 0;
+    seChannel = waveform.electrode1;
+}
+
+static bool StartProgramNack(void)
+{
+    //Check that electrode1 != electrode2
+    if(program.params.electrode1 != 0 && program.params.electrode2 != 0 )
+    {
+        if(program.params.electrode1 == program.params.electrode2)
+        {
+            PutConstString("Error: channel1 = channel2\n");     
+            return false;
+        }
+    }
+
+    if(program.params.electrode3 != 0 && program.params.electrode4 != 0 )
+    {
+        if(program.params.electrode3 == program.params.electrode4)
+        {
+            PutConstString("Error: channel3 = channel4\n");     
+            return false;
+        }
+    }
+
+    DCDC_ENABLE_IO_RF1_SetHigh();
+    RecalculateProgram();
+    TMR1_Counter16BitSet(0);        // Clear the counter
+    TMR1_Start();
+    return true;
+}
+
+static void StartProgram(void)
+{
+    treatmentOngoing = false;
+    
+    // Default super electrode settings
+    seEnabled = false;
+    
+    if(battChrgOngoing == false && stateContactScan == STATE_CONTACT_SCAN_IDLE)
+    {
+        // Setting timer handler is only needed when super electrode is used
+        //TMR1_SetInterruptHandler(&Timer1PhaseStateMachineCb);
+
+        if(StartProgramNack() == true)
+            treatmentOngoing = true;
+    }
+    else
+    {
+        commandOngoing = false;        
+    }
+    
+    PutConstString("n-ok ");    
+}
+
+static void StopProgram(void)
+{
+    if(treatmentOngoing == true)
+        stopTreatment = STOP_TREATMENT_STEP_1;
+    
+    PutConstString("N-ok ");
+}
+
+static void StateMeasureIMUHdl(void)
+{
+    uint16_t reply;
+    int8_t buf[6];
+    static uint8_t printCntr = 0;
+
+    switch(stateMeasureIMU)
+    {
+    case STATE_MEASURE_IMU_OUT_X:
+        reply = LIS331DLHTRGetOutX();
+        itoaU16(reply, buf);
+        PutConstString((char*)buf);
+        PutConstString("  ");
+        stateMeasureIMU = STATE_MEASURE_IMU_OUT_Y;
+        break;
+
+    case STATE_MEASURE_IMU_OUT_Y:
+        reply = LIS331DLHTRGetOutY();
+        itoaU16(reply, buf);
+        PutConstString((char*)buf);
+        PutConstString("  ");
+        stateMeasureIMU = STATE_MEASURE_IMU_OUT_Z;
+        break;
+
+    case STATE_MEASURE_IMU_OUT_Z:
+        reply = LIS331DLHTRGetOutX();
+        itoaU16(reply, buf);
+        PutConstString((char*)buf);
+        
+        if(++printCntr < 1)
+        {
+            PutConstString("  ");
+        }
+        else
+        {
+            PutConstString("\n\r");
+            printCntr = 0;
+        }
+        stateMeasureIMU = STATE_MEASURE_IMU_IDLE;
+        break;
+
+    case STATE_MEASURE_IMU_IDLE:
+        break;
+    }
+}
+
+static void MeasureElectrodesHdl(void)
+{
+    switch(stateMeasureElectrodes)
+    {
+    case STATE_MEASURE_ELECTRODES_INIT:
+        //LATAbits.LATA4 = 1;     // Just for debug to see where the AD-measurements are running, LED-indication
+        electrodeADValReady = false;
+        ch = channel_AN3;                                   // Select electrode+ to measure
+        ADC1_ChannelSelect(ch);
+        ADC1_SoftwareTriggerEnable();
+        stateMeasureElectrodes = STATE_MEASURE_ELECTRODE_PLUS;
+        break;
+        
+    case STATE_MEASURE_ELECTRODE_PLUS:
+        if(electrodeADValReady == true)
+        {
+            electrodeADValReady = false;
+            electrodeADValPlus = ADC1BUF0;
+            ch = channel_AN4;                                   // Select electrode+ to measure
+            ADC1_ChannelSelect(ch);
+            ADC1_SoftwareTriggerEnable();
+            stateMeasureElectrodes = STATE_MEASURE_ELECTRODE_MINUS;
+        }
+        break;
+
+    case STATE_MEASURE_ELECTRODE_MINUS:
+        if(electrodeADValReady == true)
+        {
+            electrodeADValReady = false;
+            electrodeADValMinus = ADC1BUF0;
+          //  LATAbits.LATA4 = 0;     // Just for debug to see where the AD-measurements are running, LED-indication
+            electrodeMeasurementsFinished = true;
+            stateMeasureElectrodes = STATE_MEASURE_ELECTRODES_IDLE;
+        }
+        break;
+
+    case STATE_MEASURE_ELECTRODES_IDLE:
+        break;
+    }
+}
+
+static void MeasureStrainGaugesHdl(void)
+{
+    static uint8_t noOfConv = 0;
+    int8_t buf[10];
+
+     switch(stateMeasureStrainGauges)
+    {
+    case STATE_MEASURE_STRAIN_GAUGES_INIT:
+        strainGaugeADValReady = false;
+        ch = channel_AN1;                                   // Select electrode+ to measure
+        ADC1_ChannelSelect(ch);
+       // LATAbits.LATA6 = 1;     // Just for debug to see where the AD-measurements are running, LED-indication
+        ADC1_SoftwareTriggerEnable();
+        stateMeasureStrainGauges = STATE_MEASURE_STRAIN_GAUGE_1;
+        break;
+        
+    case STATE_MEASURE_STRAIN_GAUGE_1:
+        if(strainGaugeADValReady == true)
+        {
+            //LATAbits.LATA6 = 0;     // Just for debug to see where the AD-measurements are running, LED-indication
+            strainGaugeADValReady = false;
+            strainGauge1ADVal = ADC1BUF0;
+            ch = channel_AN2;                                   // Select electrode+ to measure
+            ADC1_ChannelSelect(ch);
+            //LATAbits.LATA7 = 1;     // Just for debug to see where the AD-measurements are running, LED-indication
+            ADC1_SoftwareTriggerEnable();
+            stateMeasureStrainGauges = STATE_MEASURE_STRAIN_GAUGE_2;
+        }
+        break;
+
+    case STATE_MEASURE_STRAIN_GAUGE_2:
+        if(strainGaugeADValReady == true)
+        {
+            strainGaugeADValReady = false;
+            strainGauge2ADVal = ADC1BUF0;
+            //LATAbits.LATA7 = 0;     // Just for debug to see where the AD-measurements are running, LED-indication
+            strainGaugeMeasurementsFinished = true;
+            stateMeasureStrainGauges = STATE_MEASURE_STRAIN_GAUGES_PRINT_DATA;
+        }
+        break;
+        
+    case STATE_MEASURE_STRAIN_GAUGES_PRINT_DATA:
+        ADCBufferStrainGauges[noOfConv] = strainGauge1ADVal;
+        itoaU16(ADCBufferStrainGauges[noOfConv++], buf);
+
+        if(strainGauge1ADVal > 999)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+            UART2_Write(buf[3]);
+        }
+        else if(strainGauge1ADVal > 99)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+        }
+        else if(strainGauge1ADVal > 9)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+        }
+        else
+        {
+            UART2_Write(buf[0]);
+        }
+
+        UART2_Write(' ');
+
+        ADCBufferStrainGauges[noOfConv] = strainGauge2ADVal;
+        itoaU16(ADCBufferStrainGauges[noOfConv++], buf);
+
+        if(strainGauge2ADVal > 999)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+            UART2_Write(buf[3]);
+        }
+        else if(strainGauge2ADVal > 99)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+        }
+        else if(strainGauge2ADVal > 9)
+        {
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+        }
+        else
+        {
+            UART2_Write(buf[0]);
+        }
+
+        if(noOfConv < 8)
+        {
+            UART2_Write(' ');
+        }
+        else
+        {
+            UART2_Write('\n');
+            UART2_Write('\r');
+            noOfConv = 0;
+        }
+
+        stateMeasureStrainGauges = STATE_MEASURE_STRAIN_GAUGES_IDLE;
+        break;
+
+    case STATE_MEASURE_STRAIN_GAUGES_IDLE:
+        break;
+    }
+}
+
+static void StartStrainGaugeMeasurements(void)
+{
+    strainGaugeMeasurementsOngoing = true;
+    TMR2_Counter16BitSet(0);        // Clear the counter
+    TMR2_Start();
+}
+
+static void StopStrainGaugeMeasurements(void)
+{
+    strainGaugeMeasurementsOngoing = false;
+    TMR2_Stop();
+}
+
+static void StartIMUMeasurements(void)
+{
+/*    int8_t buf[6];
+    uint8_t reply;
+
+    reply = LIS331DLHTRGetMode();
+    itoaU16((uint16_t)reply, buf);
+    PutConstString("\n\r");
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+
+    if(reply != 0x37)
+    {
+        // The IMU is not powered, do it
+        PutConstString("Activate IMU\n\r");
+        LIS331DLHTRSetMode();
+    }*/
+    LIS331DLHTRSetMode();       // Power on the IMU
+
+    imuMeasurementsOngoing = true;
+    TMR2_Counter16BitSet(0);        // Clear the counter
+    TMR2_Start();
+}
+
+static void StopIMUMeasurements(void)
+{
+/*    int8_t buf[6];
+    uint8_t reply;
+
+    reply = LIS331DLHTRGetMode();
+    itoaU16((uint16_t)reply, buf);
+    PutConstString("\n\r");
+    PutConstString((char*)buf);
+    PutConstString("\n\r");
+
+    PutConstString("Deactivate IMU\n\r");*/
+    LIS331DLHTRPowerOff();
+
+    imuMeasurementsOngoing = false;
+    TMR2_Stop();    
+}
+
+static void StartContactScanning(void)
+{
+    if(treatmentOngoing == false && battChrgOngoing == false)
+    {
+        stateContactScan = STATE_CONTACT_SCAN_INIT;
+    }
+    else
+    {
+        commandOngoing = false;
+    }
+}
+
+static void BattChrgStatCb(void)
+{
+    static STATE_BATT_CHRG_LED_T stateBattChrgLED = STATE_BATT_CHRG_LED_1;
+    static bool blinkLEDActive = false;
+    static uint8_t periodCntr = 0;
+    
+    if(IO_BATT_CHRG_STAT_RF2_GetValue() == 0)
+    {
+        // The battery is being charged
+        if(blinkLEDActive == false)
+        {
+            // Stop treatment or contact scan if any of them is ongoing
+            if(treatmentOngoing == true)
+            {
+                stopTreatment = STOP_TREATMENT_STEP_1;
+            }
+            else if(stateContactScan != STATE_CONTACT_SCAN_IDLE)
+            {
+                stateContactScan = STATE_CONTACT_SCAN_DISCARD;
+            }
+            
+            // Activate blinking
+            battChrgOngoing = true;
+            blinkLEDActive = true;
+            
+            // Prepare for the state machine
+            periodCntr = 0;
+            stateBattChrgLED = STATE_BATT_CHRG_LED_1;
+        }
+        else
+        {
+            periodCntr++;
+    
+            switch(stateBattChrgLED)
+            {
+            case STATE_BATT_CHRG_LED_1:
+                LED1_IO_RF0_SetLow();      // LED on
+                periodCntr = 0;
+                stateBattChrgLED = STATE_BATT_CHRG_LED_2;
+                break;
+
+            case STATE_BATT_CHRG_LED_2:
+                LED1_IO_RF0_SetHigh();      // LED off
+                periodCntr = 0;
+                stateBattChrgLED = STATE_BATT_CHRG_LED_3;
+                break;
+
+            case STATE_BATT_CHRG_LED_3:
+                if(periodCntr >= 2)
+                {
+                    LED1_IO_RF0_SetLow();      // LED on
+                    periodCntr = 0;
+                    stateBattChrgLED = STATE_BATT_CHRG_LED_4;
+                }
+                break;
+
+            case STATE_BATT_CHRG_LED_4:
+                LED1_IO_RF0_SetHigh();      // LED off
+                periodCntr = 0;
+                stateBattChrgLED = STATE_BATT_CHRG_LED_5;
+                break;
+
+            case STATE_BATT_CHRG_LED_5:
+                if(periodCntr >= 10)
+                {
+                    LED1_IO_RF0_SetLow();      // LED on
+                    periodCntr = 0;
+                    stateBattChrgLED = STATE_BATT_CHRG_LED_2;
+                }
+                break;
+            }
+        }
+    }
+    else
+    {
+        if(blinkLEDActive == true)
+        {
+            blinkLEDActive = false;
+            battChrgOngoing = false;
+            LED1_IO_RF0_SetHigh();      // LED off
+        }
+    }
+}
+
+static void MsgHdl(void)
+{
+    static bool unlockMsgHdl = false;
+    
+    if(UART2_IsRxReady())
+    {
+        uint8_t cmd;
+        int8_t buf[6];
+        
+        cmd = UART2_Read(); 
+
+        if(unlockMsgHdl == false && cmd == 'X')
+        {
+            unlockMsgHdl = true;
+        }
+        
+        //if(unlockMsgHdl == true)
+        {
+            if(treatmentOngoing == true && cmd != 'N')
+            {
+                //PutConstString("Skip ");
+            }
+            else
+            {
+                switch(cmd)
+                {
+/*                case 'h':
+                    PutConstString("1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890\n\r");
+                    break;*/
+                    
+                case 't':
+                    // Test communication
+                    commandOngoing = true;
+                    PutConstString("Ok ");
+                    commandOngoing = false;
+                    break;
+
+                case 'a':
+                    commandOngoing = true;
+                    GetPacketBinASCII(&program.params.amplitude);
+                    //GetPacket3Bytes(&program.params.amplitude);
+                    
+                    if(program.params.amplitude > DAC_MAX_CURRENT_MILLI_AMPERE)
+                        program.params.amplitude = DAC_MAX_CURRENT_MILLI_AMPERE;
+                    
+                    PutConstString("a-ok ");
+                    commandOngoing = false;
+                    break;
+
+                case 'A':
+                    commandOngoing = true;
+                    GetPacket(&program.params.amplitude2);
+                    PutConstString("A-ok ");
+                    commandOngoing = false;
+                    break;
+
+                case 'f':
+                    commandOngoing = true;
+                    GetPacket(&program.params.frequency);
+                    PutConstString("f-ok ");
+                    commandOngoing = false;
+                    break;
+
+                case 'd':
+                    // Set phase duration
+                    commandOngoing = true;
+                    GetPacket(&program.params.phaseNoOfTicks);
+                    
+                    if(program.params.phaseNoOfTicks < 1)
+                        program.params.phaseNoOfTicks = 1;
+                    
+                    PutConstString("d-ok ");
+                    commandOngoing = false;
+                    break;
+
+                case 'o':
+                    commandOngoing = true;
+                    GetPacket(&program.params.onTime);
+                    PutConstString("o-ok ");
+                    itoaU16((uint16_t)program.params.onTime, buf);
+                    commandOngoing = false;
+                    break;
+
+                case 'O':
+                    commandOngoing = true;
+                    GetPacket(&program.params.offTime);
+                    PutConstString("O-ok ");
+                    commandOngoing = false;
+                    break;
+
+                case 'c':
+                    commandOngoing = true;
+                    GetPacket(&program.params.contractions);
+                    PutConstString("c-ok ");
+                    commandOngoing = false;
+                    break;
+
+                case 'r':
+                    commandOngoing = true;
+                    GetPacket(&program.params.rampUp);
+                    PutConstString("r-ok ");
+                    commandOngoing = false;
+                    break;
+
+                case 'R':
+                    commandOngoing = true;
+                    GetPacket(&program.params.rampDown);
+                    PutConstString("R-ok ");
+                    commandOngoing = false;
+                    break;
+
+                case 'p': // Read current program configuration
+                    commandOngoing = true;
+                    GetProgram();
+                    commandOngoing = false;
+                    break;           
+
+                case 's': // Save program configuration in EEPROM
+                    commandOngoing = true;
+                    SaveProgram();
+                    commandOngoing = false;
+                    break;   
+
+                case 'l': // Load program configuration from EEPROM
+                    commandOngoing = true;
+                    LoadProgram();
+                    commandOngoing = false;
+                    break;
+
+                case 'n': // Start stimulation program
+                    commandOngoing = true;
+                    StartProgram();
+                    break;
+
+                case 'N': // Stop stimulation program
+                    StopProgram();
+                    break;
+
+                case 'M':
+                    commandOngoing = true;
+                    GetPacket(&program.params.electrode1);
+                    PutConstString("M-ok ");
+                    commandOngoing = false;
+                    break;
+
+                case 'm':
+                    commandOngoing = true;
+                    GetPacket(&program.params.electrode2);
+                    PutConstString("m-ok ");
+                    commandOngoing = false;
+                    break;
+
+                case 'Q':
+                    commandOngoing = true;
+                    GetPacket(&program.params.electrode3);
+                    PutConstString("Q-ok ");
+                    commandOngoing = false;
+                    break;
+
+                case 'q':
+                    commandOngoing = true;
+                    GetPacket(&program.params.electrode4);
+                    PutConstString("q-ok ");
+                    commandOngoing = false;
+                    break;
+
+                case 'b':
+                    commandOngoing = true;
+                    StartStrainGaugeMeasurements();
+                    break;
+
+                case 'B':
+                    StopStrainGaugeMeasurements();
+                    commandOngoing = false;
+                    break;
+
+                case 'i':
+                    commandOngoing = true;
+                    StartIMUMeasurements();
+                    break;
+
+                case 'I':
+                    StopIMUMeasurements();
+                    commandOngoing = false;
+                    break;
+
+                case 'g':
+                    if(commandOngoing == false)
+                    {
+                        commandOngoing = true;
+                        StartContactScanning();
+                    }
+                    break;
+
+                //-------------------------------------------- Test commands ----------------------------------------------
+                case 'u':
+                    {
+                        uint8_t* startAddr;
+                        startAddr = BR24T32ReadProgram();
+
+                        for(uint8_t i = 0; i < SIZE_OF_PROGRAM; i++)
+                            program.b[i] = *(startAddr +i);
+
+                        PutConstString("u-ok ");
+                    }
+                    break;
+
+                case 'U':
+                    {
+                        uint16_t reply;
+
+                        reply = LIS331DLHTRGetOutX();
+                        itoaU16(reply, buf);
+                        PutConstString((char*)buf);
+                        PutConstString("  ");
+                    }
+                    break;
+                        
+                case 'w':
+                    {
+                        int8_t buf[6];
+                        uint8_t reply;
+
+                        reply = LIS331DLHTRGetWhoAmI();
+                        itoaU16((uint16_t)reply, buf);
+                        PutConstString((char*)buf);
+                        reply = LIS331DLHTRGetMode();
+                        itoaU16((uint16_t)reply, buf);
+                        PutConstString((char*)buf);
+                    }
+                    break;
+                    
+                case 'W':
+                    {
+                        LIS331DLHTRSetMode();
+                        PutConstString("W-ok");
+                    }
+                    break;
+                    
+                case 'x':
+                    DCDC_ENABLE_IO_RF1_SetHigh();
+                    DACSetValue(120);        // Set amplitude
+                    (*electrodes[0])(STATE_ELECTRODE_POS);
+                    (*electrodes[1])(STATE_ELECTRODE_GND);
+                    IO_LOW_ELECTRODE_EN_SetHigh();
+                    PutConstString("x-ok ");
+                    break;
+                    
+                case 'y':
+                    DCDC_ENABLE_IO_RF1_SetHigh();
+                    DACSetValue(120);        // Set amplitude
+                    (*electrodes[0])(STATE_ELECTRODE_GND);
+                    (*electrodes[1])(STATE_ELECTRODE_POS);
+                    IO_LOW_ELECTRODE_EN_SetHigh();
+                    PutConstString("y-ok ");
+                    break;
+
+                case 'z':
+                    DCDC_ENABLE_IO_RF1_SetLow();
+                    DACSetValue(0);        // Set amplitude
+                    (*electrodes[0])(STATE_ELECTRODE_TRISTATE);
+                    (*electrodes[1])(STATE_ELECTRODE_TRISTATE);
+                    IO_LOW_ELECTRODE_EN_SetLow();
+                    PutConstString("z-ok ");
+                    break;
+/*#ifdef PWM_OUTPUT
+                case 'x':
+                    TMR3_Counter16BitSet(0);
+                    TMR3_SoftwareCounterClear();
+                    TMR2_Start();
+                    TMR3_Start();
+                    OC1_Start();
+                    PutConstString("x-ok\n\r");
+                    break;
+
+                case 'X':
+                    TMR2_Stop();
+                    TMR3_Stop();
+                    OC1_Stop();
+                    PutConstString("X-ok\n\r");
+                    break;
+#endif*/
+#if 0
+                case 'x':
+                    DACSetValueTest(0);
+                    PutConstString("x");
+                    break;
+
+                case 'X':
+                    DACSetValueTest(1);
+                    PutConstString("X");
+                    break;
+
+                case 'y':
+                    DACSetValueTest(2);
+                    PutConstString("y");
+                    break;
+
+                case 'Y':
+                    DACSetValueTest(3);
+                    PutConstString("Y");
+                    break;
+
+                case 'z':
+                    DACSetValueTest(4);
+                    PutConstString("z");
+                    break;
+#endif
+#if 0
+                case 'w':
+                    TMR2_Start();
+                    PutConstString("Start timer 2\n\r");
+                    break;
+
+                case 'W':
+                    TMR2_Stop();
+                    LATAbits.LATA4 = 0;
+                    LATAbits.LATA5 = 0;
+                    LATAbits.LATA6 = 0;
+                    LATAbits.LATA7 = 0;
+
+                    PutConstString("Stop timer 2\n\r");
+                    break;
+
+                case 'e':
+                    ch = channel_AN5;
+
+                    PutConstString("Run ADC1 ch5\n\r");
+
+                    ADC1_ChannelSelect(ch);
+                    //AD1CON1.ASAM = 1;
+                    ADC1_SoftwareTriggerEnable();
+                    break;
+
+                case 'E':
+    /*                ch = channel_AN4;
+
+                    PutConstString("Run ADC1 ch4\n\r");
+
+                    ADC1_ChannelSelect(ch);
+                    ADC1_SoftwareTriggerEnable();*/
+                    break;
+
+                case 'v':
+                    //UART2_Write('L');
+                    LATDbits.LATD0 = 0;
+                    LATGbits.LATG15= 0;
+                    LATGbits.LATG12= 0;
+                    LATGbits.LATG13= 0;
+                    break;
+
+                case 'V':
+                    LATDbits.LATD0 = 1;
+                    LATGbits.LATG15= 1;
+                    LATGbits.LATG12= 1;
+                    LATGbits.LATG13= 1;
+                    break;
+#endif
+                default:
+                    //UART2_Write(cmd);
+                    break;
+                }
+            }
+        }
+    }    
+}
+
+static void StopTreatmentHdl(void)
+{
+    if(stopTreatment == STOP_TREATMENT_STEP_2)
+    {
+        TMR1_Stop();
+         
+//        LATAbits.LATA4 = 0;     // Just for debug to see  where in the pulse the program is, LED-indication
+  //      LATAbits.LATA5 = 0;     // Just for debug to see  where in the pulse the program is, LED-indication
+    //    LATAbits.LATA6 = 0;     // Just for debug to see  where in the pulse the program is, LED-indication
+      //  LATAbits.LATA7 = 0;     // Just for debug to see  where in the pulse the program is, LED-indication
+        DACSetValue(0);
+        treatmentOngoing = false;
+        LED1_IO_RF0_SetHigh();      // Make sure to turn off the LED
+        //PutConstString("N-ok \n\r");
+        DCDC_ENABLE_IO_RF1_SetLow();
+        stopTreatment = STOP_TREATMENT_IDLE;
+        commandOngoing = false;
+    }
+}
+
+static void ADCHdl(void)
+{
+    if(adcValueReady == true)
+    {
+        static uint8_t strainGaugeValBufIndex = 0;
+        uint16_t strainGaugeVal;
+#ifndef MEASURE_STRAIN_GAUGE
+        static uint8_t noOfConv = 0;
+        int8_t buf[10];
+#endif
+/*#ifdef PWM_OUTPUT
+       uint16_t dutyCycle;
+#endif*/
+        adcValueReady = false;
+
+        switch(ch)
+        {
+        case channel_AN0:
+            break;
+
+        case channel_AN1:
+            strainGaugeADValReady = true;
+            break;
+
+        case channel_AN2:
+            strainGaugeADValReady = true;
+            break;
+
+        case channel_AN3:
+            electrodeADValReady = true;
+            break;
+
+        case channel_AN4:
+            electrodeADValReady = true;
+/*            ADCBufferCh4[noOfConv] = ADC1BUF0;                
+
+            itoaU16(ADCBufferCh4[noOfConv], buf);
+//                UART2_Write(hexPrefix[0]);
+//              UART2_Write(hexPrefix[1]);
+            UART2_Write(buf[0]);
+            UART2_Write(buf[1]);
+            UART2_Write(buf[2]);
+            UART2_Write(buf[3]);
+
+            if(++noOfConv < 4)
+            {
+                // Start a new conversion
+                UART2_Write(' ');
+                ADC1_SoftwareTriggerEnable();
+            }
+            else
+            {
+                // Finish conversion after 4 samples
+                UART2_Write('\n');
+                UART2_Write('\r');
+                noOfConv = 0;
+            }*/
+            break;
+                
+        case channel_AN5:
+            strainGaugeVal = ADC1BUF0;
+#ifdef MEASURE_STRAIN_GAUGE
+            strainGaugeValBuf[strainGaugeValBufIndex++] = (uint8_t)(strainGaugeVal & 0xFF);
+            strainGaugeValBuf[strainGaugeValBufIndex++] = (uint8_t)((strainGaugeVal >> 8) & 0xFF);
+            strainGaugeValBuf[strainGaugeValBufIndex++] = 0;        // The PC-program expects values from two strain gauges, so simulate the second one
+            strainGaugeValBuf[strainGaugeValBufIndex++] = 0;        // The PC-program expects values from two strain gauges, so simulate the second one
+            
+            if(strainGaugeValBufIndex >= SIZE_OF_STRAIN_GAUGE_VAL_BUF)
+            {
+                for(uint8_t i = 0; i < SIZE_OF_STRAIN_GAUGE_VAL_BUF; i++)
+                    UART2_Write(strainGaugeValBuf[i]);
+                
+                UART2_Write('\n');
+                UART2_Write('\r');
+                strainGaugeValBufIndex = 0;
+            }
+/*#elif defined(PWM_OUTPUT)
+            // Scale input range to 1.0 ms -> 2.0 ms. PWM-period is 20 ms
+            // 20 ms with 62.5 kHz clock on TMR3 => 0x4E1 on TMR3 period counter
+            // 1 ms <-> 0x3E, 2 ms <-> 0x7D
+            // AD-range: 0 -> 1023, 0 <-> 0x3E, 1023 <-> 0x7D
+            // 0.5 ms <-> 0x1F, 2.5 ms <-> 0x9C
+            //dutyCycle = (strainGaugeVal * (0x7D - 0x3E)) / 1023 + 0x3E;
+            dutyCycle = (uint16_t)(((uint32_t)strainGaugeVal * (0x9C - 0x1F)) / 1023 + 0x1F);
+            OC1RS = dutyCycle;
+            if(OC1CONbits.OCM == 0)
+                OC1_Start();
+#else*/
+            ADCBufferCh5[noOfConv] = strainGaugeVal;
+
+            itoaU16(ADCBufferCh5[noOfConv], buf);
+
+            if(ADC1BUF0 > 999)
+            {
+                UART2_Write(buf[0]);
+                UART2_Write(buf[1]);
+                UART2_Write(buf[2]);
+                UART2_Write(buf[3]);
+            }
+            else if(ADC1BUF0 > 99)
+            {
+                UART2_Write(buf[0]);
+                UART2_Write(buf[1]);
+                UART2_Write(buf[2]);
+            }
+            else if(ADC1BUF0 > 9)
+            {
+                UART2_Write(buf[0]);
+                UART2_Write(buf[1]);
+            }
+            else
+            {
+                UART2_Write(buf[0]);
+            }
+
+            if(++noOfConv < 8)
+            {
+                // Start a new conversion
+                UART2_Write(' ');
+//                ADC1_SoftwareTriggerEnable();
+            }
+            else
+            {
+                // Finish conversion after 8 samples
+                UART2_Write('\n');
+                UART2_Write('\r');
+                noOfConv = 0;
+            }
+#endif
+            break;
+
+        default:
+            break;
+        }
+    }
+}
+
+void NEMSInit(void)
+{
+    int8_t buf[6];
+    uint8_t reply;
+
+    LED1_IO_RF0_SetHigh();                                          // The LED should be turned off
+    IO_HIGH_ELECTRODE_EN_SetLow();
+    IO_LOW_ELECTRODE_EN_SetLow();
+    TMR1_SetInterruptHandler(&Timer1PhaseStateMachineCb);            // Interrupt at 50 us (20 kHz), contains a state machine for handling the electrode pulses
+    TMR2_SetInterruptHandler(&Timer2Cb);                             // Interrupt at 200 ms (50 Hz), used for strain gauge measurements
+    TMR3_SetInterruptHandler(&BattChrgStatCb);
+    ADC1_SetInterruptHandler(&ADCValuesCb);                          // Measures contractions
+    commandOngoing = false;
+    treatmentOngoing = false;
+    battChrgOngoing = false;
+    electrodeADValReady = false;
+    adcValueReady = false;
+    electrodeMeasurementsFinished = false;
+    tickCntr = 0;
+    tickCntrLEDBlink = 0;
+    pulseCntr = 0;
+    stopTreatment = STOP_TREATMENT_IDLE;
+    seEnabled = false;
+    freqMultiplier = 4;
+    //setDACValue2 = SET_DAC_VALUE_IDLE;
+    runPulseStateMachine = false;
+    strainGaugeMeasurementsOngoing = false;
+    imuMeasurementsOngoing = false;
+    
+    program.params.amplitude = DAC_MAX_CURRENT_MILLI_AMPERE;
+    program.params.amplitude2 = 1;
+    program.params.frequency = 35;                  // 35 Hz
+    program.params.phaseNoOfTicks = 5;              // 250 us
+    program.params.symmetryFactor = 1;
+    program.params.onTime = 20;                      // 2 sec
+    program.params.offTime = 30;                     // 3 sec
+    program.params.contractions = 3;
+    program.params.rampUp = 8;                     // 15 deci sec
+    program.params.rampDown = 14;                   // 10 deci sec
+    program.params.electrode1 = 0;
+    program.params.electrode2 = 1;
+    program.params.electrode3 = 2;
+    program.params.electrode4 = 3;
+    
+    // Shouldn't be needed
+    statePhase = STATE_PHASE_IDLE;
+    statePulse = STATE_PULSE_IDLE;
+    stateMeasureIMU = STATE_MEASURE_IMU_IDLE;
+    stateContactScan = STATE_CONTACT_SCAN_IDLE;
+    stateMeasureElectrodes = STATE_MEASURE_ELECTRODES_IDLE;
+    stateMeasureStrainGauges = STATE_MEASURE_STRAIN_GAUGES_IDLE;
+    
+    DACSetValue(0);
+    InitElectrodes();
+   
+    TMR3_Start();       // For check of battery charging
+    //OC1_Stop();
+}
+ 
+void NEMSHdl(void)
+{
+    MsgHdl();
+    StopTreatmentHdl();
+    ADCHdl();
+    PulseHdl();
+    StateContactScanHdl();
+    StateMeasureIMUHdl();
+    MeasureElectrodesHdl();
+    MeasureStrainGaugesHdl();
+        
+    if(commandOngoing == false)
+    {
+        Idle();
+    }
+}
