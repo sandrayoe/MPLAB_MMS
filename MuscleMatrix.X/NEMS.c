@@ -17,13 +17,6 @@
 #include "common.h"
 #include "NEMS.h"
 
-#include "math.h"
-
-#define REF_VOLTAGE               3.3
-#define ADC_MAX                   1023
-#define MIN_VOLTAGE               2.75
-#define MAX_VOLTAGE               4.2
-
 #define FOSC                      32000000UL  // 32 MHz clock
 #define FCY                       (FOSC / 2)  // Instruction cycle frequency for XC16
 
@@ -59,13 +52,11 @@ void NEMSInit(void)
     TMR3_SetInterruptHandler(&TMR3Cb);
     ADC1_SetInterruptHandler(&ADCValuesCb);
     
-    //ADC1_InterruptEnable();
     ADC1_ChannelSelect(channel_AN0);
     ADC1_SoftwareTriggerEnable();
     
     adcValueReady = false;
-    userMeasureRequested = false; 
-    
+
     TMR3_Start();
 }
 

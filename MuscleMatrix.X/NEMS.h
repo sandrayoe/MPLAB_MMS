@@ -13,18 +13,14 @@ extern "C" {
 #endif
 
 void NEMSInit(void);
-void SendBatteryData(uint16_t adcResult, float voltage, float percent);
 void ADCValuesCb(void);
 void DelayUs(uint32_t us);
 
 
 float ConvertADCToVoltage(uint16_t adcResult);
-float CalculateBattPercent(float voltage);
 
 
 extern volatile bool adcValueReady; 
-static volatile bool userMeasureRequested; 
-
 
 
 #ifdef	__cplusplus
