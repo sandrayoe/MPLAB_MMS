@@ -59,15 +59,9 @@
 #include "NEMS.h"
 #include "common.h"
 
-bool IsUARTReadyToTransmit(void)
-{
-    return (U1STA & 0x0200) == 0; // Check TXBF flag (TX buffer full) - this may vary for your microcontroller
-}
-
 int main(void)
 {
     SYSTEM_Initialize();
-    
     NEMSInit();
     
     LED1_IO_RF0_SetLow();      // LED on
@@ -75,46 +69,22 @@ int main(void)
     LED1_IO_RF0_SetHigh();      // LED off
     
     while(1)
-    {
-        // Check if TMR3 requested a measurement
-        if (userMeasureRequested)
-        {
-            userMeasureRequested = false;
-            ADC1_InterruptFlagClear(); 
-            ADC1_SoftwareTriggerEnable();
-        }
-       
-        // Check if ADC result is ready
+    {       
         if (adcValueReady)
         {
                     //PutConstString("adcValueReady is TRUE\r\n"); // Debugging print
-                    
                     adcValueReady = false;
-                    // Read ADC result and process it
-                    //uint16_t adcResult = ADC1BUF0;
                     PutConstString("ADC:");
+                    // Read ADC result and process it
                     uint16_t adcResult = ADC1BUF0; 
                     
                     int8_t buffer[10];
                     itoaU16(adcResult, buffer);
                     
-                    while (!IsUARTReadyToTransmit()) {
-                        DelayUs(5000); // or an appropriate delay for your system
-                    }
-                    
                     PutString((uint8_t*)buffer);
                     PutConstString("\r\n");
-                    
-                    //float batteryVoltage = ConvertADCToVoltage(adcResult);
-                    //float batteryPercent = CalculateBattPercent(batteryVoltage);
-
-                // Send data via UART
-                //SendBatteryData(adcResult, batteryVoltage, batteryPercent);  
-                
         }
-           
         
-
     }
     return 1;
 }

@@ -85,7 +85,6 @@ void ADC1_Initialize (void)
     
     IFS0bits.AD1IF = 0; // Clear ADC interrupt flag
 
-
     // Enabling ADC1 interrupt.
     IEC0bits.AD1IE = 1;
     
@@ -117,12 +116,11 @@ void __attribute__ ( ( __interrupt__ , auto_psv, weak ) ) _ADC1Interrupt ( void 
         adcValueReady = true;
         
         //PutConstString("ADC Ready\r\n");
-        
         //if(ADC1_DefaultInterruptHandler) 
         //{ 
             //ADC1_DefaultInterruptHandler(); 
         //}
-
+        
         // clear the ADC interrupt flag
         IFS0bits.AD1IF = 0;
     }
