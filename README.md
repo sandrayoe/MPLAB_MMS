@@ -2,7 +2,9 @@
 
 MPLAB X IDE, MMS CU 2
 
-Purpose: read the battery voltage with its ADC value, then transmit it to the web application. Print it in console as well as the interface, also acts as the serial monitor. 
+Purpose: read the battery voltage with its ADC value, then transmit it to the web application. Print it in console as well as the interface, also acts as the serial monitor.
+
+Important files: NEMS.c, main.c, adc1.c, tmr3.c
 
 Ver1 - 28/2/2025 - 13:00pm
 Raw, will be tidied more 
